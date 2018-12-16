@@ -63,12 +63,12 @@ print_r($result);
   api提領--提領編號重複 => api查詢提領狀態
   api提領--request欄位驗證有誤 => [FL] error_log => end
   api提領--會員不存在          => [FL] error_log => end
-  api提領--可提領金額必須大於0 => [FL] error_log => end
+  api提領--可提領金額必須大於0  => [FL] error_log => end
   api提領--可提領金額不足      => [FL] error_log => end
 
   api查詢提領狀態--處理中 => wait_log => end
-  api查詢提領狀態--成功 => [OK] => end
-  api查詢提領狀態--失敗 => [FL] => end
+  api查詢提領狀態--成功  => [OK] => end
+  api查詢提領狀態--失敗  => [FL] => end
   api查詢提領狀態--request欄位驗證有誤 => error_log => end
   api查詢提領狀態--提領資料不存在,表示未提領 => push queue
 
@@ -92,7 +92,67 @@ function do_Qppdw_process(){
   $ppApi = new WithdrawApi;
 
 ## 讀檔有無未完成
+  if ($str = fgets($fh, 1024)) {
+    $wdata = '';
+    $arr = json_decode($str, true);
+    $sql = "select pp_wd_status, spay_amt, spay_date, cpay_amt, cpay_date from c_pp_wd where pp_wd_no = '".$arr['no']."' and pp_wd_status not in ('OK', 'FL', 'ERR')";
+    ora_connect();
+    if ($ppay = ora_sql_query($sql)) {
+      if ($ppay[0] == 'INI') {
+        $wdata = $arr;
+      }
+      elseif ($ppay[1] == 0 && $ppay[3] == 0) {
+        put_errlog('OK', '', $arr);
+      }
+      else {
+        $cnt = 0;
+        if ($ppay[1] > 0 && !$ppay[2]) {
+          $cnt++;
+          $undone['S'] = $arr[no].'S';
+        }
+        if ($ppay[3] > 0 && !$ppay[4]) {
+          $cnt++;
+          $undone['C'] = $arr[no].'C';
+        }
+      }
+    }
+
+    if ($cnt) { 
+      foreach($undone as $wallet => $id) {
+        $rqry = api_Query($ppApi, $id);
+        if ($rqry == 'none') {
+          $wdata = $arr;
+        }
+        elseif ($rqry['result'] == '1') {
+          put_waitlog($id);
+        }
+        elseif ($rqry['result'] == '2') {
+          $sql_cmd = "pp_wd_type = 'OK', ";
+          if ($wallet == 'S') $sql_cmd.= "spay_amt = '".$rqry['amount']."', spay_date = '".date("Y/m/d H:i:s", $rqry['create_time'])."', ";
+          if ($wallet == 'C') $sql_cmd.= "cpay_amt = '".$rqry['amount']."', cpay_date = '".date("Y/m/d H:i:s", $rqry['create_time'])."', ";
+          $sql = "update ".$_e["_or_u"]."c_pp_wd set $sql_cmd upd_date = sysdate where pp_wd_no = '".$arr[no]."' ";
+          $ora = ora_connect();
+          ora_sql_exec($sql, $ora);
+        }
+        elseif ($rqry['result'] == '3') {
+          if (--$num) $sql_cmd = "pp_wd_type = 'RUN', "; //二寶未完成
+          else $sql_cmd = "pp_wd_type = 'FL', ";
+          if ($wallet == 'S') $sql_cmd.= "spay_amt = '0', ";
+          if ($wallet == 'C') $sql_cmd.= "cpay_amt = '0', ";
+          $sql = "update ".$_e["_or_u"]."c_pp_wd set $sql_cmd upd_date = sysdate where pp_wd_no = '".$arr[no]."' and pp_wd_type != 'OK' ";
+          $ora = ora_connect();
+          ora_sql_exec($sql, $ora);
+        }
+        else {
+
+        }
+
+      }
+    }
+  }
+  
 ## 先查詢提領 再決定是否執行提領
+
 
   while(1) {
     while($item = ssdb_pop()) {
@@ -125,14 +185,13 @@ function do_Qppdw_process(){
       $rwd = api_Withdraw($wd_amt);
       if ($rwd == 'exit') exit;
       if ($rwd == 'continue') continue;
-
     }
 
     $i++;
 
-    if(!$item){
-
+    if (!$item) {
       pcntl_sigprocmask(SIG_UNBLOCK, array(SIGUSR1));
+
       if($is_over_updates){
         $is_over_updates = 0;
       }else{
@@ -142,7 +201,7 @@ function do_Qppdw_process(){
       //echo "sleep 3秒 \n";
       sleep(3);
 
-      if(1 == $my_env['SIGUSR1'])  unlink_file($target_file);
+      if (1 == $my_env['SIGUSR1']) unlink_file($target_file);
       pcntl_sigprocmask(SIG_BLOCK, array(SIGUSR1));
     }
 
@@ -220,7 +279,9 @@ function api_Withdraw($ppApi, $wdata, $wd_amt) {
   $rtry_max = 3;
 
   foreach ($wd_amt as $wallet => $amount) {
+
     if ($wallet=='A' || $amount<=0) continue;
+    $rtry = 0;
 
     do {
       $pla_withdraw_id = $wdata[no].$wallet;
@@ -231,96 +292,80 @@ function api_Withdraw($ppApi, $wdata, $wd_amt) {
           'amount' => $amount
       ]);
 
-      if ($r = parse_msg($res, 'Withdraw')) {
-        if ($r[way] === 0) { ##exit
-          put_errlog('', $r[log], $wdata);
-          sms("0933135121", "pp token error, server exit"); //send_sms("pp token error, server exit"); ##基本上不會執行到一半才出現token錯誤
-          return 'exit';
-        }
-        elseif ($r[way] < 0) { ##continue
-          put_errlog('FL', $r[log], $wdata);
-          return 'continue';
-        }
-        else { ## way=1 or way=11 連線問題或編號重複 => 查提領狀態
-          if ($r[way] == 1) usleep(1000);
-          $rqry = api_Query($ppApi, $pla_withdraw_id); //查詢提領
-          if ($rqry['status'] == '1') { //處理中 => 進待查詢
-            put_waitlog($pla_withdraw_id);
-            break;
+      if ($r = parse_msg($res, 'Withdraw')) { //error
+          if ($r[way] === 0) { ##exit
+              put_errlog('', $r[log], $wdata);
+              sms("0933135121", "pp token error, server exit"); //send_sms("pp token error, server exit"); ##基本上不會執行到一半才出現token錯誤
+              return 'exit';
           }
-          elseif ($rqry['status'] == '2') { //成功
-            --$num;
-            $sql_cmd = "pp_wd_type = 'OK', ";
-            //if (--$num) $sql_cmd = "pp_wd_type = 'RUN', "; //二寶未完成
-            //else $sql_cmd = "pp_wd_type = 'OK', ";
-            if ($wallet == 'S') $sql_cmd.= "spay_amt = '".$rqry['amount']."', spay_date = '".date("Y/m/d H:i:s", $rqry['create_time'])."', ";
-            if ($wallet == 'C') $sql_cmd.= "cpay_amt = '".$rqry['amount']."', cpay_date = '".date("Y/m/d H:i:s", $rqry['create_time'])."', ";
-
-            $sql = "update ".$_e["_or_u"]."c_pp_wd set $sql_cmd upd_date = sysdate where pp_wd_no = '".$wdata[no]."' ";
-            $ora = ora_connect();
-            ora_sql_exec($sql, $ora);
-            break;
+          elseif ($r[way] < 0) { ##continue
+              put_errlog('FL', $r[log], $wdata);
+              return 'continue';
           }
-          elseif ($rqry['status'] == '3') { //失敗
-            if (--$num) $sql_cmd = "pp_wd_type = 'RUN', "; //二寶未完成
-            else $sql_cmd = "pp_wd_type = 'FL', ";
-            if ($wallet == 'S') $sql_cmd.= "spay_amt = '0', ";
-            if ($wallet == 'C') $sql_cmd.= "cpay_amt = '0', ";
+          else { ## way=1 or way=11 連線問題或編號重複 => 查提領狀態
+              if ($r[way] == 1) usleep(1000);
+              $rqry = api_Query($ppApi, $pla_withdraw_id); //查詢提領
 
-            $sql = "update ".$_e["_or_u"]."c_pp_wd set $sql_cmd upd_date = sysdate where pp_wd_no = '".$wdata[no]."' and pp_wd_type != 'OK' ";
-            $ora = ora_connect();
-            ora_sql_exec($sql, $ora);
-            break;
+              if ($rqry == 'none') { //無提領資料
+                  $rtry++;
+                  usleep(500);
+                  continue;
+              }
+
+              elseif ($rqry['status'] == '1') { //處理中 => 進待查詢
+                  put_waitlog($pla_withdraw_id);
+                  break;
+              }
+
+              elseif ($rqry['status'] == '2') { //成功
+                  --$num;
+                  $sql_cmd = "pp_wd_type = 'OK', ";
+                  if ($wallet == 'S') $sql_cmd.= "spay_amt = '".$rqry['amount']."', spay_date = '".date("Y/m/d H:i:s", $rqry['create_time'])."', ";
+                  if ($wallet == 'C') $sql_cmd.= "cpay_amt = '".$rqry['amount']."', cpay_date = '".date("Y/m/d H:i:s", $rqry['create_time'])."', ";
+                  $sql = "update ".$_e["_or_u"]."c_pp_wd set $sql_cmd upd_date = sysdate where pp_wd_no = '".$wdata[no]."' ";
+                  $ora = ora_connect();
+                  ora_sql_exec($sql, $ora);
+                  break;
+              }
+
+              elseif ($rqry['status'] == '3') { //失敗
+                  if (--$num) $sql_cmd = "pp_wd_type = 'RUN', "; //二寶未完成
+                  else $sql_cmd = "pp_wd_type = 'FL', ";
+                  if ($wallet == 'S') $sql_cmd.= "spay_amt = '0', ";
+                  if ($wallet == 'C') $sql_cmd.= "cpay_amt = '0', ";
+                  $sql = "update ".$_e["_or_u"]."c_pp_wd set $sql_cmd upd_date = sysdate where pp_wd_no = '".$wdata[no]."' and pp_wd_type != 'OK' ";
+                  $ora = ora_connect();
+                  ora_sql_exec($sql, $ora);
+                  break;
+              }
+
+              else {  //任何錯誤 => 進待查詢
+                  put_waitlog($pla_withdraw_id);
+                  break;
+              }
           }
-          elseif ($rqry == 'none') { //無提領資料
-            $rtry++;
-            usleep(500);
-            continue;
-          }
-          else {  //任何錯誤 => 進待查詢
-            //$rqry=='exit' || !$rqry
-            put_waitlog($pla_withdraw_id);
-            break;
-          }
-
-        }
-
-        else { ##retry
-
-          put_errlog('', $r[log], $wdata);
-          $rtry++;
-          usleep(500);
-          continue;
-        }
       }
-      else {
-        if ($res->result == 'OK') {
+      elseif ($res->result == 'OK') { //access
           --$num;
-          $sql_cmd = "pp_wd_type = 'RUN', ";
+          $sql_cmd = "pp_wd_type = 'OK', ";
           if ($wallet == 'S') $sql_cmd.= "spay_date = '".date("Y/m/d H:i:s", $res->create_time)."', ";
           if ($wallet == 'C') $sql_cmd.= "cpay_date = '".date("Y/m/d H:i:s", $res->create_time)."', ";
           $sql = "update ".$_e["_or_u"]."c_pp_wd set $sql_cmd upd_date = sysdate where pp_wd_no = '".$wdata[no]."' ";
           $ora = ora_connect();
           ora_sql_exec($sql, $ora);
           break;
-        }
       }
+      else { //other error
+        put_waitlog($pla_withdraw_id);
+        break;
+      }
+
     } while($rtry < $rtry_max);
-
-    if ($num) {
-
-    }
-    else {
-      'FL' 'OK'
-      $sql = "update ".$_e["_or_u"]."c_pp_wd set pp_wd_type = '', upd_date = sysdate where pp_wd_no = '".$wdata[no]."' ";
-      $ora = ora_connect();
-      ora_sql_exec($sql, $ora);
-    }
 
   }
 
   if ($num) {
-    ##未完成
+#未完成
   }
 
 }
@@ -341,8 +386,8 @@ function api_Query($ppApi, $id) {
 }
 
 
-/*
-'{
+/***
+{
     "curl_url": "https:\/\/dev-c2capi.pchomepay.com.tw\/v1\/member\/wallet\/balance?pla_mem_id=1875982&wallet=S%2CC&__branch__=1474-new-pool-c2capi",
     "curl_code": 502,
     "curl_message": "HTTP\/1.1 502 Bad Gateway",
@@ -351,9 +396,9 @@ function api_Query($ppApi, $id) {
         "wallet": "S,C"
     },
     "curl_response": "<html>\r\n<head><title>502 Bad Gateway<\/title><\/head>\r\n<body bgcolor=\"white\">\r\n<center><h1>502 Bad Gateway<\/h1><\/center>\r\n<hr><center>nginx\/1.10.3 (Ubuntu)<\/center>\r\n<\/body>\r\n<\/html>\r\n"
-}'
+}
 
-'Array
+Array
 (
     [code] => 900
     [message] => {
@@ -366,10 +411,8 @@ function api_Query($ppApi, $id) {
     },
     "curl_response": "{\"error_type\":\"member_error\",\"code\":113002,\"message\":\"platform member is not a PChomePay member\"}"
 }
-)'
-*/
-
-
+)
+***/
 function parse_msg($msg, $step) { //way = -1:處理下一筆 0:結束程式 1:等待重試
   if (!isset($msg['code'])) return;
 
@@ -392,10 +435,9 @@ function parse_msg($msg, $step) { //way = -1:處理下一筆 0:結束程式 1:�
           }
           else $log.= '[curl_code:'.$message['curl_code'].'] => '.$message['curl_message'];
       }
-      else $log.= $msg['message'];
+      else $log.= '=> '.$msg['message'];
   }
-  elseif (is_array($msg) && $msg['message']) $log = $msg['message'];
-  else $log.= '=> '.$msg;
+  else $log.= '=> '.$msg['message'];
 
   return $r;
 }
@@ -417,7 +459,7 @@ function put_errlog($type, $log, $wdata) {  ## /export/home/webuser/c2c/log/ppwd
 
   if ($type && preg_match("/^[0-9]+$/", $wdata['no'])) { ##update type & log
     $sql_cmd = ($type != 'OK')? "and pp_wd_status != 'OK' " : "";
-    $sql_log = ($log)? "err_log = err_log + '$log' ," : "";
+    $sql_log = (trim($log))? "err_log = err_log + '$log' ," : "";
     $sql = "update ".$_e["_or_u"]."c_pp_wd set pp_wd_type = '$type', ".$sql_log." upd_date = sysdate where pp_wd_no = '".$wdata[no]."' ".$sql_cmd;
     $ora = ora_connect();
     ora_sql_exec($sql, $ora);
@@ -426,8 +468,8 @@ function put_errlog($type, $log, $wdata) {  ## /export/home/webuser/c2c/log/ppwd
   return;
 }
 
-function put_waitlog($log){
-  $file = "/export/home/webuser/c2c/data/ppwd/wait.txt";
+function put_waitlog($log){ ## /export/home/webuser/c2c/data/ppwd/recheck.txt
+  $file = "/export/home/webuser/c2c/data/ppwd/recheck.txt";
   error_log($log."\n", 3, $file); ##收集等待再次查詢的提領編號
 }
 
